@@ -1,0 +1,276 @@
+name: Apache Cloudberry Build
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+  actions: write
+  checks: read
+  pull-requests: read
+
+jobs:
+
+  ## ======================================================================
+
+  record-workflow-start:
+    runs-on: ubuntu-latest
+    container:
+      image: postgres:15
+    outputs:
+      workflow_id: ${{ steps.record-start.outputs.workflow_id }}
+    steps:
+      - name: Record workflow start
+        id: record-start
+        shell: bash {0}
+        env:
+          PGHOST: ${{ secrets.DB_HOST }}
+          PGPORT: ${{ secrets.DB_PORT }}
+          PGDATABASE: cloudberry_metrics
+          PGUSER: github_actions
+          PGPASSWORD: ${{ secrets.DB_GITHUB_ACTIONS_PASSWORD }}
+        run: |
+          set -e  # Exit on error
+
+          # Determine trigger type
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TRIGGER="pull_request"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TRIGGER="manual"
+          else
+            TRIGGER="push"
+          fi
+
+          # Insert workflow record and get ID
+          WORKFLOW_ID=$(psql sslmode=require -v ON_ERROR_STOP=1 -qtAX <<EOF
+          INSERT INTO workflow_runs
+            (github_run_id, github_run_attempt, trigger_type, branch_name, commit_sha, pr_number, started_at)
+          VALUES
+            (${{ github.run_id }},
+             ${{ github.run_attempt }},
+             '$TRIGGER',
+             '${{ github.ref_name }}',
+             '${{ github.sha }}',
+             ${{ github.event.pull_request.number || 'NULL' }},
+             NOW())
+          RETURNING workflow_run_id;
+          EOF
+          ) || exit 1  # Exit if psql fails
+
+          # Verify we got a workflow ID
+          if [[ -z "$WORKFLOW_ID" ]]; then
+            echo "Error: Failed to get workflow_id"
+            exit 1
+          fi
+
+          # Set output for downstream jobs
+          echo "workflow_id=${WORKFLOW_ID}" >> "$GITHUB_OUTPUT"
+
+  ## ======================================================================
+
+  build:
+    name: Build Apache Cloudberry
+    env:
+      JOB_TYPE: build
+    needs: [record-workflow-start]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      os_name: ${{ steps.capture-build-info.outputs.os_name }}
+      os_version: ${{ steps.capture-build-info.outputs.os_version }}
+      kernel_version: ${{ steps.capture-build-info.outputs.kernel_version }}
+      cpu_count: ${{ steps.capture-build-info.outputs.cpu_count }}
+      cpu_model: ${{ steps.capture-build-info.outputs.cpu_model }}
+      total_memory_mb: ${{ steps.capture-build-info.outputs.total_memory_mb }}
+      shared_memory: ${{ steps.capture-build-info.outputs.shared_memory }}
+      disk_total: ${{ steps.capture-build-info.outputs.disk_total }}
+      disk_used: ${{ steps.capture-build-info.outputs.disk_used }}
+      disk_available: ${{ steps.capture-build-info.outputs.disk_available }}
+      container_id: ${{ steps.capture-build-info.outputs.container_id }}
+      container_image: ${{ steps.capture-build-info.outputs.container_image }}
+      network_info: ${{ steps.capture-build-info.outputs.network_info }}
+      process_count: ${{ steps.capture-build-info.outputs.process_count }}
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+      options: >-
+        --user root
+        -h cdw
+    steps:
+      - name: Capture Build OS and System Information
+        id: capture-build-info
+        env:
+          CONTAINER_IMAGE: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+        shell: bash {0}
+        run: |
+          set -e  # Exit on error
+
+          df -kh /
+          rm -rf /__t/*
+          df -kh /
+
+          # OS Information
+          OS_NAME=$(grep ^NAME= /etc/os-release | cut -d'=' -f2 | tr -d '"')
+          OS_VERSION=$(grep ^VERSION_ID= /etc/os-release | cut -d'=' -f2 | tr -d '"')
+          KERNEL_VERSION=$(uname -r)
+
+          # CPU Information
+          CPU_COUNT=$(nproc)
+          CPU_MODEL=$(lscpu | grep "Model name" | awk -F: '{print $2}' | xargs)
+
+          # Memory Information
+          TOTAL_MEMORY=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+          TOTAL_MEMORY_MB=$((TOTAL_MEMORY / 1024))
+          SHARED_MEMORY=$(df -h /dev/shm | awk 'NR==2 {print $2}')
+
+          # Disk Space on '/'
+          DISK_TOTAL=$(df -h / | awk 'NR==2 {print $2}')
+          DISK_USED=$(df -h / | awk 'NR==2 {print $3}')
+          DISK_AVAILABLE=$(df -h / | awk 'NR==2 {print $4}')
+
+          # Container-Specific Information
+          CONTAINER_ID=$(hostname)
+
+          # Sanitize Network Information
+          NETWORK_INFO=$(ip -brief addr | awk '{print $1 "=" $3}' | sed 's/@/_/g')
+          PROCESS_COUNT=$(ps -e | wc -l)
+
+          # Write outputs to $GITHUB_OUTPUT
+          {
+            echo "os_name=${OS_NAME}"
+            echo "os_version=${OS_VERSION}"
+            echo "kernel_version=${KERNEL_VERSION}"
+            echo "cpu_count=${CPU_COUNT}"
+            echo "cpu_model=${CPU_MODEL}"
+            echo "total_memory_mb=${TOTAL_MEMORY_MB}"
+            echo "shared_memory=${SHARED_MEMORY}"
+            echo "disk_total=${DISK_TOTAL}"
+            echo "disk_used=${DISK_USED}"
+            echo "disk_available=${DISK_AVAILABLE}"
+            echo "container_id=${CONTAINER_ID}"
+            echo "container_image=${CONTAINER_IMAGE}"
+            echo "network_info=${NETWORK_INFO}"
+            echo "process_count=${PROCESS_COUNT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Perform build
+        shell: bash {0}
+        run: |
+          echo "Running build..."
+          # Simulate test process
+          sleep 5
+
+  ## ======================================================================
+
+  record-job-environments:
+    name: Record Job Environments
+    needs: [record-workflow-start, build]
+    runs-on: ubuntu-latest
+    container:
+      image: postgres:15
+    steps:
+      - name: Insert Job Environment into Database
+        shell: bash {0}
+        env:
+          PGHOST: ${{ secrets.DB_HOST }}
+          PGPORT: ${{ secrets.DB_PORT }}
+          PGDATABASE: cloudberry_metrics
+          PGUSER: github_actions
+          PGPASSWORD: ${{ secrets.DB_GITHUB_ACTIONS_PASSWORD }}
+        run: |
+          set -e  # Exit on error
+
+          # Insert job environment record
+          JOB_ENV_ID=$(psql sslmode=require -v ON_ERROR_STOP=1 -qtAX <<EOF
+          INSERT INTO job_environments (
+            workflow_run_id, job_name, os_name, os_version, kernel_version,
+            cpu_count, cpu_model, total_memory_mb, shared_memory,
+            disk_total, disk_used, disk_available, network_info,
+            process_count, container_id, container_image
+          ) VALUES (
+            (SELECT workflow_run_id FROM workflow_runs WHERE github_run_id = '${{ github.run_id }}'),
+            'Build Apache Cloudberry',
+            '${{ needs.build.outputs.os_name }}',
+            '${{ needs.build.outputs.os_version }}',
+            '${{ needs.build.outputs.kernel_version }}',
+            ${{ needs.build.outputs.cpu_count }},
+            '${{ needs.build.outputs.cpu_model }}',
+            ${{ needs.build.outputs.total_memory_mb }},
+            '${{ needs.build.outputs.shared_memory }}',
+            '${{ needs.build.outputs.disk_total }}',
+            '${{ needs.build.outputs.disk_used }}',
+            '${{ needs.build.outputs.disk_available }}',
+            '${{ needs.build.outputs.network_info }}',
+            ${{ needs.build.outputs.process_count }},
+            '${{ needs.build.outputs.container_id }}',
+            '${{ needs.build.outputs.container_image }}')
+          RETURNING job_env_id;
+          EOF
+          )
+
+          # Verify we got a job environment ID
+          if [[ -z "$JOB_ENV_ID" ]]; then
+            echo "Error: Failed to insert job environment"
+            exit 1
+          fi
+
+          # Log the inserted job environment ID
+          echo "Inserted Job Environment ID: $JOB_ENV_ID"
+
+  ## ======================================================================
+
+  test:
+    name: Test Apache Cloudberry
+    needs: [record-workflow-start, build, record-job-environments]
+    env:
+      JOB_TYPE: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+      options: >-
+        --user root
+        -h cdw
+    steps:
+      - name: Perform Tests
+        id: perform-tests
+        shell: bash {0}
+        run: |
+          echo "Running tests..."
+          # Simulate test process
+          sleep 5
+
+  ## ======================================================================
+
+  record-workflow-end:
+    needs: [record-workflow-start, build, record-job-environments, test]
+    if: always()  # Run even if previous jobs fail
+    runs-on: ubuntu-latest
+    container:
+      image: postgres:15
+    steps:
+      - name: Record workflow completion
+        env:
+          PGHOST: ${{ secrets.DB_HOST }}
+          PGPORT: ${{ secrets.DB_PORT }}
+          PGDATABASE: cloudberry_metrics
+          PGUSER: github_actions
+          PGPASSWORD: ${{ secrets.DB_GITHUB_ACTIONS_PASSWORD }}
+          WORKFLOW_ID: ${{ needs.record-workflow-start.outputs.workflow_id }}
+        shell: bash {0}
+        run: |
+          set -e  # Exit on error
+
+          # Update workflow record with completion time and status
+          psql -qtAX <<EOF
+          UPDATE workflow_runs
+          SET
+            completed_at = NOW(),
+            workflow_status = 'completed'
+          WHERE workflow_run_id = $WORKFLOW_ID;
+          EOF
